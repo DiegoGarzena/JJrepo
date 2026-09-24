@@ -39,7 +39,7 @@ class PointsAlong3DLineAlgorithm(QgsProcessingAlgorithm):
     def groupId(self):
         return 'vector3d'
 
-	def shortHelpString(self):
+    def shortHelpString(self):
         return (
             "Generates points at a constant 3D spatial distance along a line using a DTM raster for Z coordinates.<br><br>"
             "<b>MANDATORY PRE-PROCESSING STEPS:</b><br>"
@@ -55,7 +55,7 @@ class PointsAlong3DLineAlgorithm(QgsProcessingAlgorithm):
             "only between original vertices or will require continuous raster sampling, significantly slowing down processing.</i>"
         )
 
-	def initAlgorithm(self, config=None):
+    def initAlgorithm(self, config=None):
         self.addParameter(
             QgsProcessingParameterVectorLayer(
                 self.INPUT_LINE,
