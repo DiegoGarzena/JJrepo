@@ -60,7 +60,7 @@ class PointsAlong3DLineAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterVectorLayer(
                 self.INPUT_LINE,
                 'Input Line Layer',
-                [QgsProcessing.TypeVectorLine]
+                [QgsProcessing.SourceType.TypeVectorLine]
             )
         )
         self.addParameter(
@@ -97,7 +97,7 @@ class PointsAlong3DLineAlgorithm(QgsProcessingAlgorithm):
             self.OUTPUT,
             context,
             fields,
-            QgsWkbTypes.PointZ,
+            QgsWkbTypes.Type.PointZ,
             line_layer.crs()
         )
 
