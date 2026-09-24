@@ -39,42 +39,40 @@ class PointsAlong3DLineAlgorithm(QgsProcessingAlgorithm):
     def groupId(self):
         return 'vector3d'
 
-    def shortHelpString(self):
+	def shortHelpString(self):
         return (
-            "Genera punti a distanza tridimensionale (3D) reale e costante lungo una linea.<br><br>"
-            "<b>MANDATORY PRE-PROCESSING STEPS / PASSAGGI PRELIMINARI OBBLIGATORI:</b><br>"
-            "Per garantire la massima precisione ed efficienza, prima di eseguire questo strumento è "
-            "obbligatorio preparare la linea eseguendo questi 2 passaggi nell'ordine esatto:<br><br>"
-            "1. <b>Densify (Densifica)</b><br>"
-            "   - <i>English:</i> <b>Densify by interval</b><br>"
-            "   - <i>Italiano:</i> <b>Densifica tramite intervallo</b><br>"
-            "   - Imposta un intervallo piccolo (es. 0.1 o 0.2 m) per infittire i vertici della linea e consentirle di seguire l'andamento del terreno.<br><br>"
-            "2. <b>Drape (Adagia sul DTM)</b><br>"
-            "   - <i>English:</i> <b>Drape (set Z value from raster)</b><br>"
-            "   - <i>Italiano:</i> <b>Drape (imposta valore Z da raster)</b><br>"
-            "   - Proietta la linea densificata sul DTM per assegnare la quota Z reale a ciascun vertice.<br><br>"
-            "<i>Nota: Se non si eseguono questi passaggi in ordine, il calcolo della distanza 3D avverrà "
-            "solo tra i vertici originari o richiederà un campionamento continuo del raster rallentando l'elaborazione.</i>"
+            "Generates points at a constant 3D spatial distance along a line using a DTM raster for Z coordinates.<br><br>"
+            "<b>MANDATORY PRE-PROCESSING STEPS:</b><br>"
+            "To ensure accurate 3D distance calculations and high execution performance, "
+            "you MUST prepare your line geometry in the following exact order:<br><br>"
+            "1. <b>Densify by interval</b><br>"
+            "   - <i>Tool:</i> <b>Densify by interval</b><br>"
+            "   - Set a small interval (e.g., 0.1 or 0.2 meters) to add intermediate vertices along the line so it can closely follow the terrain profile.<br><br>"
+            "2. <b>Drape (set Z value from raster)</b><br>"
+            "   - <i>Tool:</i> <b>Drape (set Z value from raster)</b><br>"
+            "   - Overlay the densified line onto your DTM raster to assign actual elevation (Z coordinates) to every vertex.<br><br>"
+            "<i>Note: Skipping these pre-processing steps will result in 3D distances being calculated "
+            "only between original vertices or will require continuous raster sampling, significantly slowing down processing.</i>"
         )
 
-    def initAlgorithm(self, config=None):
+	def initAlgorithm(self, config=None):
         self.addParameter(
             QgsProcessingParameterVectorLayer(
                 self.INPUT_LINE,
-                'Layer Linea di Input / Input Line Layer',
+                'Input Line Layer',
                 [QgsProcessing.TypeVectorLine]
             )
         )
         self.addParameter(
             QgsProcessingParameterRasterLayer(
                 self.INPUT_DTM,
-                'Raster DTM (per la quota Z / for Z values)'
+                'DTM Raster Layer (for Z elevation)'
             )
         )
         self.addParameter(
             QgsProcessingParameterDistance(
                 self.INTERVAL,
-                'Distanza 3D tra i punti (metri) / 3D Distance interval (meters)',
+                '3D Distance Interval (meters)',
                 defaultValue=6.0,
                 parentParameterName=self.INPUT_LINE
             )
@@ -82,7 +80,7 @@ class PointsAlong3DLineAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 self.OUTPUT,
-                'Punti 3D Generati / Output 3D Points'
+                'Output 3D Points'
             )
         )
 
