@@ -1,15 +1,16 @@
 [general]
 name=Points Along 3D Line
-qgisMinimumVersion=3.0
-description=Generates regular 3D points along lines considering terrain elevation (DTM).
-version=1.0.0
+qgisMinimumVersion=3.22
+qgisMaximumVersion=3.99
+description=Generates 3D equidistant points along lines with raster DTM elevation and detailed geometry attributes.
+version=1.0.1
 author=Diego Garzena
 email=dieggarz@gmail.com
-about=Generates points along a line at fixed 3D spatial distances using a DTM raster for Z coordinates.
+about=Tool designed for geophysics, surveying, civil engineering, and geotechnics. Generates points at fixed 3D spatial distances along lines using a DTM raster for elevation. Outputs rich attribute tables including line_id, seq_id, projected coordinates, 2D/3D cumulative and step distances, elevation differences, slope (deg/%), and azimuth.
 homepage=https://github.com/DiegoGarzena/JJrepo
 tracker=https://github.com/DiegoGarzena/JJrepo/issues
 repository=https://github.com/DiegoGarzena/JJrepo/tree/main/points_along_3d_line_plugin
 category=Vector
+tags=3d,vector,points,dtm,elevation,geophysics,line,sampling,slope,azimuth
 experimental=False
 deprecated=False
-tags=3d, vector, points, line, dtm, raster, elevation

@@ -4,7 +4,22 @@ A QGIS Processing algorithm designed to generate point vector layers along lines
 
 ---
 
-## 💡 Background & Motivation
+## Features
+- True 3D spatial interval sampling along line geometries.
+- Full custom attribute generation:
+  - `line_id`: Original line identifier.
+  - `seq_id`: Point sequence along the line.
+  - `x_coord`, `y_coord`: Projected/Geographic coordinates in any selected CRS.
+  - `z_ele`: Point elevation (DTM / Z value).
+  - `dist_2d_p`, `dist_2d_tot`: Step and total 2D distance.
+  - `dist_3d_p`, `dist_3d_tot`: Step (fixed interval) and total 3D distance.
+  - `delta_z_p`: Elevation difference relative to previous point.
+  - `slope_deg`, `slope_pct`: Segment slope.
+  - `azimuth_deg`: Direction angle (0°-360°).
+  
+---
+
+## Background & Motivation
 
 Standard GIS tools (like QGIS's native *Points along geometry*) calculate intervals strictly in **2D planar space**. In hilly or mountainous terrain, a 2D planar distance significantly underestimates the actual 3D ground distance traversed along the slope. 
 
@@ -12,7 +27,7 @@ This plugin was developed to bridge this gap by computing true 3D Euclidean dist
 
 ---
 
-## 🎯 Target Audience & Practical Use Cases
+## Target Audience & Practical Use Cases
 
 This tool is especially valuable for professionals working with complex topographies across various domain fields:
 
@@ -23,7 +38,7 @@ This tool is especially valuable for professionals working with complex topograp
 
 ---
 
-## ⚙️ Mandatory Workflow (Pre-Processing)
+## Mandatory Workflow (Pre-Processing)
 
 To achieve maximum accuracy and optimal execution speed, input geometries **must** follow a two-step pre-processing pipeline before running this algorithm:
 
@@ -34,15 +49,16 @@ To achieve maximum accuracy and optimal execution speed, input geometries **must
 
 ---
 
-## 🚀 Installation & Usage
+## Installation & Usage
 
-1. Install via **QGIS Plugin Manager** (or load from ZIP).
-2. Open **Processing Toolbox** $\rightarrow$ **Points Along 3D Line Tools** $\rightarrow$ **Points Along 3D Line**.
-3. Select your pre-processed line layer, DTM raster, and target 3D distance interval (meters).
+1. Download the latest release `.zip`.
+2. In QGIS, go to `Plugins > Manage and Install Plugins... > Install from ZIP`.
+3. Open **Processing Toolbox** $\rightarrow$ **Points Along 3D Line Tools** $\rightarrow$ **Points Along 3D Line**.
+4. Select your pre-processed line layer, DTM raster, and target 3D distance interval (meters).
 4. Run the algorithm to generate the output 3D Point layer (`PointZ`).
 
 ---
 
-## 📄 License
+## License
 
 Distributed under the **GNU General Public License v2.0 (GPL-2.0)**. See the `LICENSE` file for details.
