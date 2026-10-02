@@ -1,41 +1,106 @@
+# -*- coding: utf-8 -*-
+"""
+Points Along 3D Line - QGIS Processing provider and algorithm.
+
+The geometric work (densification, bilinear DTM sampling, 3D resampling,
+attribute computation) lives in ``core.py``; this module only connects it to
+the QGIS Processing framework.
+"""
+import math
+
+from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (
-    QgsProcessingProvider,
-    QgsProcessingAlgorithm,
-    QgsProcessing,
-    QgsProcessingParameterVectorLayer,
-    QgsProcessingParameterRasterLayer,
-    QgsProcessingParameterDistance,
-    QgsProcessingParameterCrs,
-    QgsProcessingParameterField,
-    QgsProcessingParameterString,
-    QgsProcessingParameterBoolean,
-    QgsProcessingParameterFeatureSink,
+    NULL,
+    Qgis,
+    QgsCoordinateTransform,
+    QgsCsException,
     QgsFeature,
+    QgsFeatureSink,
+    QgsField,
+    QgsFields,
     QgsGeometry,
     QgsPoint,
     QgsPointXY,
+    QgsProcessing,
+    QgsProcessingAlgorithm,
+    QgsProcessingException,
+    QgsProcessingParameterBand,
+    QgsProcessingParameterBoolean,
+    QgsProcessingParameterCrs,
+    QgsProcessingParameterDefinition,
+    QgsProcessingParameterDistance,
+    QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterFeatureSource,
+    QgsProcessingParameterField,
+    QgsProcessingParameterRasterLayer,
+    QgsProcessingParameterString,
+    QgsProcessingProvider,
+    QgsRectangle,
     QgsWkbTypes,
-    QgsFields,
-    QgsField,
-    QgsCoordinateTransform,
-    QgsProject
 )
-from qgis.PyQt.QtCore import QVariant
-import math
+
+from .core import (GridSampler, build_records, densify_xy, drape_vertices,
+                   resample_3d)
+
+# --- QGIS version compatibility (plugin supports 3.22 -> 3.99) -------------
+if Qgis.QGIS_VERSION_INT >= 33800:
+    from qgis.PyQt.QtCore import QMetaType
+    _T_STRING = QMetaType.Type.QString
+    _T_INT = QMetaType.Type.Int
+    _T_DOUBLE = QMetaType.Type.Double
+else:
+    _T_STRING = QVariant.String
+    _T_INT = QVariant.Int
+    _T_DOUBLE = QVariant.Double
+
+if Qgis.QGIS_VERSION_INT >= 33000:
+    _POINT_Z = Qgis.WkbType.PointZ
+else:
+    _POINT_Z = QgsWkbTypes.PointZ
+
+if Qgis.QGIS_VERSION_INT >= 33600:
+    _SOURCE_LINE = Qgis.ProcessingSourceType.VectorLine
+else:
+    _SOURCE_LINE = QgsProcessing.TypeVectorLine
+
+try:
+    _FLAG_ADVANCED = Qgis.ProcessingParameterFlag.Advanced
+except AttributeError:
+    _FLAG_ADVANCED = QgsProcessingParameterDefinition.FlagAdvanced
+
+HOME_URL = 'https://github.com/DiegoGarzena/JJrepo/tree/main/points_along_3d_line_plugin'
+
+
+def _advanced(param):
+    param.setFlags(param.flags() | _FLAG_ADVANCED)
+    return param
+
+
+def _round(value, digits):
+    return None if value is None else round(value, digits)
+
+
+def _outside_valid(dist_2d, valid_range):
+    """True if a point lies on the flat extension beyond the DTM edge."""
+    return not (valid_range[0] - 1e-6 <= dist_2d <= valid_range[1] + 1e-6)
 
 
 class PointsAlong3DLineAlgorithm(QgsProcessingAlgorithm):
+    # Parameter ids (kept stable so that saved models keep working)
     INPUT_LINE = 'INPUT_LINE'
     INPUT_DTM = 'INPUT_DTM'
+    DTM_BAND = 'DTM_BAND'
     INTERVAL = 'INTERVAL'
-    TARGET_CRS = 'TARGET_CRS'
-    
-    # Gestione ID Linea
+    START_OFFSET = 'START_OFFSET'
+    INCLUDE_END = 'INCLUDE_END'
+    EXTEND_OUTSIDE = 'EXTEND_OUTSIDE'
+    DENSIFY_STEP = 'DENSIFY_STEP'
     LINE_ID_FIELD = 'LINE_ID_FIELD'
     CUSTOM_LINE_ID = 'CUSTOM_LINE_ID'
-    
-    # Parametri opzionali per gli attributi
+    TARGET_CRS = 'TARGET_CRS'
+
     ADD_LINE_ID = 'ADD_LINE_ID'
+    ADD_PART_ID = 'ADD_PART_ID'
     ADD_SEQ_ID = 'ADD_SEQ_ID'
     ADD_COORDS = 'ADD_COORDS'
     ADD_Z_ELE = 'ADD_Z_ELE'
@@ -44,8 +109,12 @@ class PointsAlong3DLineAlgorithm(QgsProcessingAlgorithm):
     ADD_DELTA_Z = 'ADD_DELTA_Z'
     ADD_SLOPE = 'ADD_SLOPE'
     ADD_AZIMUTH = 'ADD_AZIMUTH'
-    
+
     OUTPUT = 'OUTPUT'
+
+    # ------------------------------------------------------------------ meta
+    def tr(self, text):
+        return QCoreApplication.translate('PointsAlong3DLine', text)
 
     def createInstance(self):
         return PointsAlong3DLineAlgorithm()
@@ -54,372 +123,504 @@ class PointsAlong3DLineAlgorithm(QgsProcessingAlgorithm):
         return 'pointsalong3dline'
 
     def displayName(self):
-        return 'Points Along 3D Line'
+        return self.tr('Points Along 3D Line')
 
     def group(self):
-        return '3D Vector Tools'
+        return self.tr('3D Vector Tools')
 
     def groupId(self):
         return 'vector3d'
 
+    def tags(self):
+        return ['3d', 'points', 'line', 'dtm', 'elevation', 'slope',
+                'azimuth', 'interval', 'sampling', 'profile']
+
+    def shortDescription(self):
+        return self.tr('Creates points at constant 3D distances along lines, '
+                       'with elevation taken from a DTM.')
+
+    def helpUrl(self):
+        return HOME_URL
+
     def shortHelpString(self):
-        return (
-            "<b>Points Along 3D Line</b> generates 3D point features spaced at constant 3D spatial distances "
-            "along line geometries using a DTM raster to assign elevation.<br><br>"
-            "<b>MANDATORY PRE-PROCESSING STEPS:</b><br>"
-            "To guarantee precise 3D distance calculations and optimal performance, prepare your line layer in this exact order:<br>"
-            "1. <b>Densify by interval:</b> Add intermediate vertices along the line at a small interval (e.g., 0.1m - 0.5m) so the line follows terrain topography.<br>"
-            "2. <b>Drape (set Z value from raster):</b> Assign true Z coordinates from your DTM raster to every vertex.<br><br>"
-            "<b>GENERATED ATTRIBUTES:</b><br>"
-            "• <b>line_id:</b> Line identifier selected from attribute field, custom text, or default sequence.<br>"
-            "• <b>seq_id:</b> Sequential point index along each line (starting at 1).<br>"
-            "• <b>x_coord, y_coord:</b> Planimetric coordinates in the selected Target CRS.<br>"
-            "• <b>z_ele:</b> Terrain elevation (Z) extracted from DTM / 3D geometry.<br>"
-            "• <b>dist_2d_p, dist_2d_tot:</b> Step and cumulative 2D distances (meters).<br>"
-            "• <b>dist_3d_p, dist_3d_tot:</b> Step (constant interval) and cumulative 3D distances (meters).<br>"
-            "• <b>delta_z_p:</b> Elevation difference relative to the previous point.<br>"
-            "• <b>slope_deg, slope_pct:</b> Segment slope in degrees and percentage.<br>"
-            "• <b>azimuth_deg:</b> Bearing angle (0° - 360°) from the previous point.<br>"
+        return self.tr(
+            '<p>Creates points spaced at a constant <b>3D distance</b> along '
+            'line features, taking the elevation from a DTM raster. The '
+            'interval is measured on the terrain surface, not on the '
+            'horizontal plane.</p>'
+
+            '<p><b>No pre-processing is needed.</b> Each line is densified '
+            'internally, draped on the DTM with bilinear interpolation and '
+            'then walked along its 3D length. Any Z values already stored in '
+            'the input geometries are ignored.</p>'
+
+            '<h3>Why densification matters</h3>'
+            '<p>A DTM is a grid of cells, each with its own elevation, but a '
+            'line may have only two vertices over hundreds of metres: from '
+            'its geometry alone the tool would not know that the ground goes '
+            'up and down in between. <b>Densification</b> adds intermediate '
+            'vertices along the line (without moving it); the DTM elevation is '
+            'read at each of them, and the 3D distance is measured along this '
+            'polyline that follows the ground.</p>'
+            '<p>The <b>densification step</b> is the distance between these '
+            'vertices. A smaller step follows the relief more faithfully but '
+            'takes longer. A step larger than the DTM pixel skips the terrain '
+            'between vertices and <b>underestimates the 3D length</b> (points '
+            'end up too far apart on the ground). A step much smaller than '
+            'the pixel adds almost nothing, because the DTM has no more '
+            'detail than that. The default (<b>0 = automatic</b>) is half of '
+            'the DTM pixel size, which is a good choice in nearly all cases; '
+            'change it only for special needs, such as a very fast preview '
+            '(larger step) or an exceptionally detailed check (smaller '
+            'step).</p>'
+
+            '<h3>Parameters</h3>'
+            '<ul>'
+            '<li><b>Input line layer</b>: line or multiline features; '
+            'the CRS must be projected (not geographic).</li>'
+            '<li><b>DTM raster</b> and <b>band</b>: source of the elevation. '
+            'It may have a different CRS from the lines. Its elevation unit '
+            'must be the same as the horizontal unit of the line layer '
+            '(normally metres).</li>'
+            '<li><b>3D distance interval</b>: distance between consecutive '
+            'points, measured along the draped line.</li>'
+            '<li><b>Start offset</b>: 3D distance from the start of each '
+            'line at which the first point is placed.</li>'
+            '<li><b>Include end point</b>: also add the last vertex of the '
+            'line when it does not fall on a regular interval.</li>'
+            '<li><b>Keep points beyond the DTM edge</b>: only useful when '
+            'a line extends past the edge of the DTM. By default (unchecked) '
+            'points are created only where the DTM has a value, so the line '
+            'is cut at the edge. If checked, points are also created beyond '
+            'the edge, with a constant elevation equal to that of the nearest '
+            'valid vertex (as if the ground were flat there), and they are '
+            'flagged in the <i>z_extrap</i> field.</li>'
+            '<li><b>Line ID field / custom ID</b>: value written in '
+            '<i>line_id</i>. If no field is chosen, the custom text (plus '
+            'a progressive number if there are several lines) or '
+            '<i>Line_N</i> is used.</li>'
+            '<li><b>Target CRS</b>: CRS of the <i>x_coord</i> and '
+            '<i>y_coord</i> attributes. The output geometries keep the CRS '
+            'of the input lines.</li>'
+            '<li><b>Densification step</b> (advanced): see above. '
+            '0 = automatic (half of the DTM pixel size).</li>'
+            '</ul>'
+
+            '<h3>Output attributes</h3>'
+            '<ul>'
+            '<li><b>line_id</b>, <b>part_id</b>, <b>seq_id</b>: line '
+            'identifier, part number (multipart lines) and point number '
+            'along the part, starting at 1.</li>'
+            '<li><b>x_coord, y_coord</b>: coordinates in the target CRS.</li>'
+            '<li><b>z_ele</b>: elevation interpolated from the DTM.</li>'
+            '<li><b>z_extrap</b> (only if <i>Keep points beyond the DTM '
+            'edge</i> is checked): 1 for points placed beyond the DTM edge '
+            'with an assumed elevation, 0 for points with a real DTM '
+            'elevation.</li>'
+            '<li><b>dist_2d_p, dist_2d_tot</b>: horizontal distance from '
+            'the previous point / from the start of the line.</li>'
+            '<li><b>dist_3d_p, dist_3d_tot</b>: 3D distance from the '
+            'previous point / from the start of the line (equal to the '
+            'interval between regular points).</li>'
+            '<li><b>delta_z_p</b>: elevation difference from the previous '
+            'point.</li>'
+            '<li><b>slope_deg, slope_pct</b>: slope of the step from the '
+            'previous point; <b>positive uphill, negative downhill</b>. '
+            'Empty for the first point.</li>'
+            '<li><b>azimuth_deg</b>: grid bearing (0-360, clockwise from '
+            'the +Y axis of the input CRS) of the step from the previous '
+            'point; for the first point, towards the next one.</li>'
+            '</ul>'
+
+            '<h3>Notes</h3>'
+            '<ul>'
+            '<li>Distances are measured along the draped line, so they are '
+            'path lengths rather than straight chords.</li>'
+            '<li>If part of a line lies outside the DTM or on NoData, a '
+            '<b>red warning</b> is shown in the log with the affected lines. '
+            'Gaps in the middle of a line are bridged by linear interpolation '
+            'of the elevation; they are never replaced with elevation 0.</li>'
+            '<li>Lines that lie completely outside the DTM produce no '
+            'points.</li>'
+            '</ul>'
         )
 
+    # ------------------------------------------------------------ parameters
     def initAlgorithm(self, config=None):
-        self.addParameter(
-            QgsProcessingParameterVectorLayer(
-                self.INPUT_LINE,
-                'Input Line Layer',
-                [QgsProcessing.SourceType.TypeVectorLine]
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterRasterLayer(
-                self.INPUT_DTM,
-                'DTM Raster Layer (for Z elevation)'
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterDistance(
-                self.INTERVAL,
-                '3D Distance Interval (meters)',
-                defaultValue=6.0,
-                parentParameterName=self.INPUT_LINE
-            )
-        )
-        
-        # Selezione campo ID linea o prefisso/nome manuale
-        self.addParameter(
-            QgsProcessingParameterField(
-                self.LINE_ID_FIELD,
-                'Line ID Attribute Field (Optional)',
-                optional=True,
-                parentLayerParameterName=self.INPUT_LINE
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterString(
-                self.CUSTOM_LINE_ID,
-                'Custom Line Name / ID Prefix (Used if Field above is empty)',
-                optional=True,
-                defaultValue=''
-            )
-        )
-        
-        # CRS di destinazione per le coordinate in tabella (Default: CRS del progetto)
-        self.addParameter(
-            QgsProcessingParameterCrs(
-                self.TARGET_CRS,
-                'Target CRS for Attribute Coordinates (x_coord, y_coord)',
-                defaultValue='ProjectCrs'
-            )
-        )
+        self.addParameter(QgsProcessingParameterFeatureSource(
+            self.INPUT_LINE, self.tr('Input line layer'), [_SOURCE_LINE]))
 
-        # Spunte/Checkbox per la tabella degli attributi
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.ADD_LINE_ID,
-                'Include Line Name/ID (line_id)',
-                defaultValue=True
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.ADD_SEQ_ID,
-                'Include Sequential ID (seq_id)',
-                defaultValue=True
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.ADD_COORDS,
-                'Include Coordinates (x_coord, y_coord)',
-                defaultValue=True
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.ADD_Z_ELE,
-                'Include Z Elevation (z_ele)',
-                defaultValue=True
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.ADD_DIST_2D,
-                'Include 2D Distances (dist_2d_p, dist_2d_tot)',
-                defaultValue=True
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.ADD_DIST_3D,
-                'Include 3D Distances (dist_3d_p, dist_3d_tot)',
-                defaultValue=True
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.ADD_DELTA_Z,
-                'Include Step Elevation Difference (delta_z_p)',
-                defaultValue=True
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.ADD_SLOPE,
-                'Include Slope fields (slope_deg, slope_pct)',
-                defaultValue=True
-            )
-        )
-        self.addParameter(
-            QgsProcessingParameterBoolean(
-                self.ADD_AZIMUTH,
-                'Include Direction Azimuth (azimuth_deg)',
-                defaultValue=True
-            )
-        )
+        self.addParameter(QgsProcessingParameterRasterLayer(
+            self.INPUT_DTM, self.tr('DTM raster (elevation source)')))
 
-        self.addParameter(
-            QgsProcessingParameterFeatureSink(
-                self.OUTPUT,
-                '3D Sampled Points'
-            )
-        )
+        self.addParameter(_advanced(QgsProcessingParameterBand(
+            self.DTM_BAND, self.tr('DTM band'), defaultValue=1,
+            parentLayerParameterName=self.INPUT_DTM)))
 
+        interval = QgsProcessingParameterDistance(
+            self.INTERVAL, self.tr('3D distance interval'),
+            defaultValue=6.0, parentParameterName=self.INPUT_LINE)
+        interval.setMetadata({'widget_wrapper': {'decimals': 3}})
+        interval.setMinimum(0.001)
+        self.addParameter(interval)
+
+        offset = QgsProcessingParameterDistance(
+            self.START_OFFSET, self.tr('Start offset (3D distance from line start)'),
+            defaultValue=0.0, parentParameterName=self.INPUT_LINE)
+        offset.setMinimum(0.0)
+        self.addParameter(offset)
+
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.INCLUDE_END, self.tr('Include end point of each line'),
+            defaultValue=False))
+
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.EXTEND_OUTSIDE,
+            self.tr('Keep points beyond the DTM edge (flat elevation of the '
+                    'last valid point)'),
+            defaultValue=False))
+
+        self.addParameter(QgsProcessingParameterField(
+            self.LINE_ID_FIELD, self.tr('Line ID field (optional)'),
+            optional=True, parentLayerParameterName=self.INPUT_LINE))
+
+        self.addParameter(QgsProcessingParameterString(
+            self.CUSTOM_LINE_ID,
+            self.tr('Custom line ID / prefix (used when no field is selected)'),
+            optional=True, defaultValue=''))
+
+        self.addParameter(QgsProcessingParameterCrs(
+            self.TARGET_CRS,
+            self.tr('CRS for the x_coord / y_coord attributes'),
+            defaultValue='ProjectCrs'))
+
+        step = QgsProcessingParameterDistance(
+            self.DENSIFY_STEP,
+            self.tr('Densification step: distance between DTM sampling vertices '
+                    '(0 = automatic, half DTM pixel)'),
+            defaultValue=0.0, parentParameterName=self.INPUT_LINE)
+        step.setMinimum(0.0)
+        self.addParameter(_advanced(step))
+
+        for pid, label in (
+            (self.ADD_LINE_ID, 'Include line ID (line_id)'),
+            (self.ADD_PART_ID, 'Include part number (part_id)'),
+            (self.ADD_SEQ_ID, 'Include point sequence number (seq_id)'),
+            (self.ADD_COORDS, 'Include coordinates (x_coord, y_coord)'),
+            (self.ADD_Z_ELE, 'Include elevation (z_ele)'),
+            (self.ADD_DIST_2D, 'Include 2D distances (dist_2d_p, dist_2d_tot)'),
+            (self.ADD_DIST_3D, 'Include 3D distances (dist_3d_p, dist_3d_tot)'),
+            (self.ADD_DELTA_Z, 'Include elevation difference (delta_z_p)'),
+            (self.ADD_SLOPE, 'Include slope (slope_deg, slope_pct)'),
+            (self.ADD_AZIMUTH, 'Include azimuth (azimuth_deg)'),
+        ):
+            self.addParameter(_advanced(QgsProcessingParameterBoolean(
+                pid, self.tr(label), defaultValue=True)))
+
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUTPUT, self.tr('3D points')))
+
+    def checkParameterValues(self, parameters, context):
+        source = self.parameterAsSource(parameters, self.INPUT_LINE, context)
+        if source is not None and source.sourceCrs().isValid() \
+                and source.sourceCrs().isGeographic():
+            return False, self.tr(
+                'The input lines are in a geographic CRS (degrees). Reproject '
+                'them to a projected CRS (metres) first, so that distances '
+                'are meaningful.')
+        return super().checkParameterValues(parameters, context)
+
+    # --------------------------------------------------------------- helpers
+    def _auto_step(self, dtm_layer, layer_crs, context, feedback):
+        """Half of the DTM pixel size, expressed in the line layer units."""
+        px = dtm_layer.rasterUnitsPerPixelX()
+        py = dtm_layer.rasterUnitsPerPixelY()
+        dtm_crs = dtm_layer.crs()
+        size = min(px, py)
+        if dtm_crs != layer_crs:
+            try:
+                tr = QgsCoordinateTransform(dtm_crs, layer_crs, context.transformContext())
+                c = dtm_layer.extent().center()
+                p0 = tr.transform(c)
+                p1 = tr.transform(QgsPointXY(c.x() + px, c.y()))
+                p2 = tr.transform(QgsPointXY(c.x(), c.y() + py))
+                size = min(p0.distance(p1), p0.distance(p2))
+            except QgsCsException:
+                size = 0.0
+        if not size or size <= 0 or math.isnan(size):
+            feedback.pushWarning(self.tr(
+                'Could not determine the DTM pixel size; using a 1 unit '
+                'densification step.'))
+            return 1.0
+        return size / 2.0
+
+    def _build_sampler(self, dtm_layer, band):
+        # Processing runs in a background thread: read the raster through a
+        # private copy of the data provider (the layer's own one belongs to
+        # the main thread and is not thread-safe).
+        provider = dtm_layer.dataProvider()
+        try:
+            provider = provider.clone() or provider
+        except (AttributeError, TypeError):
+            pass
+        extent = provider.extent()
+        width, height = provider.xSize(), provider.ySize()
+        if width <= 0 or height <= 0:
+            raise QgsProcessingException(self.tr('The DTM raster is empty.'))
+        px = extent.width() / width
+        py = extent.height() / height
+        xmin, ymax = extent.xMinimum(), extent.yMaximum()
+
+        def read_tile(c0, r0, ncols, nrows):
+            rect = QgsRectangle(xmin + c0 * px, ymax - (r0 + nrows) * py,
+                                xmin + (c0 + ncols) * px, ymax - r0 * py)
+            block = provider.block(band, rect, ncols, nrows)
+            if block is None or not block.isValid():
+                return lambda r, c: None
+
+            def getter(r, c):
+                if block.isNoData(r, c):
+                    return None
+                v = block.value(r, c)
+                return None if v != v else v  # NaN -> NoData
+
+            return getter
+
+        return GridSampler(xmin, ymax, px, py, width, height, read_tile)
+
+    # ------------------------------------------------------------- algorithm
     def processAlgorithm(self, parameters, context, feedback):
-        line_layer = self.parameterAsVectorLayer(parameters, self.INPUT_LINE, context)
+        source = self.parameterAsSource(parameters, self.INPUT_LINE, context)
+        if source is None:
+            raise QgsProcessingException(self.invalidSourceError(parameters, self.INPUT_LINE))
         dtm_layer = self.parameterAsRasterLayer(parameters, self.INPUT_DTM, context)
+        if dtm_layer is None:
+            raise QgsProcessingException(self.tr('Invalid DTM raster layer.'))
+
+        band = self.parameterAsInt(parameters, self.DTM_BAND, context)
         interval = self.parameterAsDouble(parameters, self.INTERVAL, context)
+        start_offset = self.parameterAsDouble(parameters, self.START_OFFSET, context)
+        include_end = self.parameterAsBool(parameters, self.INCLUDE_END, context)
+        extend_outside = self.parameterAsBool(parameters, self.EXTEND_OUTSIDE, context)
+        step = self.parameterAsDouble(parameters, self.DENSIFY_STEP, context)
+        line_id_field = self.parameterAsString(parameters, self.LINE_ID_FIELD, context)
+        custom_line_id = (self.parameterAsString(parameters, self.CUSTOM_LINE_ID, context) or '').strip()
         target_crs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
 
-        line_id_field = self.parameterAsString(parameters, self.LINE_ID_FIELD, context)
-        custom_line_id = self.parameterAsString(parameters, self.CUSTOM_LINE_ID, context)
+        opt = {k: self.parameterAsBool(parameters, k, context) for k in (
+            self.ADD_LINE_ID, self.ADD_PART_ID, self.ADD_SEQ_ID, self.ADD_COORDS,
+            self.ADD_Z_ELE, self.ADD_DIST_2D, self.ADD_DIST_3D, self.ADD_DELTA_Z,
+            self.ADD_SLOPE, self.ADD_AZIMUTH)}
 
-        # Lettura delle spunte attive
-        add_line_id = self.parameterAsBool(parameters, self.ADD_LINE_ID, context)
-        add_seq_id = self.parameterAsBool(parameters, self.ADD_SEQ_ID, context)
-        add_coords = self.parameterAsBool(parameters, self.ADD_COORDS, context)
-        add_z_ele = self.parameterAsBool(parameters, self.ADD_Z_ELE, context)
-        add_dist_2d = self.parameterAsBool(parameters, self.ADD_DIST_2D, context)
-        add_dist_3d = self.parameterAsBool(parameters, self.ADD_DIST_3D, context)
-        add_delta_z = self.parameterAsBool(parameters, self.ADD_DELTA_Z, context)
-        add_slope = self.parameterAsBool(parameters, self.ADD_SLOPE, context)
-        add_azimuth = self.parameterAsBool(parameters, self.ADD_AZIMUTH, context)
+        if interval <= 0:
+            raise QgsProcessingException(self.tr('The 3D distance interval must be greater than 0.'))
 
-        # Configurazione Trasformazione di Coordinate per x_coord e y_coord
-        layer_crs = line_layer.crs()
+        layer_crs = source.sourceCrs()
+        if layer_crs.isValid() and layer_crs.isGeographic():
+            raise QgsProcessingException(self.tr(
+                'The input lines are in a geographic CRS (degrees). Reproject '
+                'them to a projected CRS (metres) first.'))
         if not target_crs.isValid():
-            target_crs = QgsProject.instance().crs()
-        transform = QgsCoordinateTransform(layer_crs, target_crs, context.transformContext())
+            project = context.project()
+            target_crs = project.crs() if project is not None else layer_crs
 
-        # Costruzione dei campi della tabella
+        # --- coordinate transforms --------------------------------------
+        coord_transform = None
+        if target_crs != layer_crs:
+            coord_transform = QgsCoordinateTransform(layer_crs, target_crs, context.transformContext())
+        coord_digits = 7 if target_crs.isGeographic() else 3
+
+        to_dtm = None
+        if dtm_layer.crs() != layer_crs:
+            to_dtm = QgsCoordinateTransform(layer_crs, dtm_layer.crs(), context.transformContext())
+
+        sampler = self._build_sampler(dtm_layer, band)
+
+        def z_at(x, y):
+            if to_dtm is None:
+                return sampler.z_at(x, y)
+            try:
+                p = to_dtm.transform(QgsPointXY(x, y))
+            except QgsCsException:
+                return None
+            return sampler.z_at(p.x(), p.y())
+
+        if step <= 0:
+            step = self._auto_step(dtm_layer, layer_crs, context, feedback)
+            feedback.pushInfo(self.tr('Automatic densification step: {0:.4g}').format(step))
+
+        # --- output fields ------------------------------------------------
         fields = QgsFields()
-        if add_line_id:
-            fields.append(QgsField("line_id", QVariant.String))
-        if add_seq_id:
-            fields.append(QgsField("seq_id", QVariant.Int))
-        if add_coords:
-            fields.append(QgsField("x_coord", QVariant.Double))
-            fields.append(QgsField("y_coord", QVariant.Double))
-        if add_z_ele:
-            fields.append(QgsField("z_ele", QVariant.Double))
-        if add_dist_2d:
-            fields.append(QgsField("dist_2d_p", QVariant.Double))
-            fields.append(QgsField("dist_2d_tot", QVariant.Double))
-        if add_dist_3d:
-            fields.append(QgsField("dist_3d_p", QVariant.Double))
-            fields.append(QgsField("dist_3d_tot", QVariant.Double))
-        if add_delta_z:
-            fields.append(QgsField("delta_z_p", QVariant.Double))
-        if add_slope:
-            fields.append(QgsField("slope_deg", QVariant.Double))
-            fields.append(QgsField("slope_pct", QVariant.Double))
-        if add_azimuth:
-            fields.append(QgsField("azimuth_deg", QVariant.Double))
 
-        (sink, dest_id) = self.parameterAsSink(
-            parameters,
-            self.OUTPUT,
-            context,
-            fields,
-            QgsWkbTypes.Type.PointZ,
-            layer_crs
-        )
+        def add(cond, name, kind):
+            if cond:
+                fields.append(QgsField(name, kind))
 
-        dtm_provider = dtm_layer.dataProvider()
+        add(opt[self.ADD_LINE_ID], 'line_id', _T_STRING)
+        add(opt[self.ADD_PART_ID], 'part_id', _T_INT)
+        add(opt[self.ADD_SEQ_ID], 'seq_id', _T_INT)
+        add(opt[self.ADD_COORDS], 'x_coord', _T_DOUBLE)
+        add(opt[self.ADD_COORDS], 'y_coord', _T_DOUBLE)
+        add(opt[self.ADD_Z_ELE], 'z_ele', _T_DOUBLE)
+        add(extend_outside, 'z_extrap', _T_INT)
+        add(opt[self.ADD_DIST_2D], 'dist_2d_p', _T_DOUBLE)
+        add(opt[self.ADD_DIST_2D], 'dist_2d_tot', _T_DOUBLE)
+        add(opt[self.ADD_DIST_3D], 'dist_3d_p', _T_DOUBLE)
+        add(opt[self.ADD_DIST_3D], 'dist_3d_tot', _T_DOUBLE)
+        add(opt[self.ADD_DELTA_Z], 'delta_z_p', _T_DOUBLE)
+        add(opt[self.ADD_SLOPE], 'slope_deg', _T_DOUBLE)
+        add(opt[self.ADD_SLOPE], 'slope_pct', _T_DOUBLE)
+        add(opt[self.ADD_AZIMUTH], 'azimuth_deg', _T_DOUBLE)
 
-        def get_z(pt):
-            if hasattr(pt, 'z') and not math.isnan(pt.z()):
-                return pt.z()
-            val, ok = dtm_provider.sample(QgsPointXY(pt.x(), pt.y()), 1)
-            return val if ok and not math.isnan(val) else 0.0
+        sink, dest_id = self.parameterAsSink(
+            parameters, self.OUTPUT, context, fields, _POINT_Z, layer_crs)
+        if sink is None:
+            raise QgsProcessingException(self.invalidSinkError(parameters, self.OUTPUT))
 
-        line_index = 0
-        for feat in line_layer.getFeatures():
+        def make_feature(rec, line_identifier, part_id, valid_range):
+            attrs = []
+            if opt[self.ADD_LINE_ID]:
+                attrs.append(line_identifier)
+            if opt[self.ADD_PART_ID]:
+                attrs.append(part_id)
+            if opt[self.ADD_SEQ_ID]:
+                attrs.append(rec['seq_id'])
+            if opt[self.ADD_COORDS]:
+                cx, cy = rec['x'], rec['y']
+                if coord_transform is not None:
+                    try:
+                        p = coord_transform.transform(QgsPointXY(cx, cy))
+                        cx, cy = p.x(), p.y()
+                    except QgsCsException:
+                        cx = cy = None
+                attrs.append(_round(cx, coord_digits))
+                attrs.append(_round(cy, coord_digits))
+            if opt[self.ADD_Z_ELE]:
+                attrs.append(_round(rec['z'], 3))
+            if extend_outside:
+                attrs.append(1 if _outside_valid(rec['dist_2d_tot'], valid_range) else 0)
+            if opt[self.ADD_DIST_2D]:
+                attrs.append(_round(rec['dist_2d_p'], 3))
+                attrs.append(_round(rec['dist_2d_tot'], 3))
+            if opt[self.ADD_DIST_3D]:
+                attrs.append(_round(rec['dist_3d_p'], 3))
+                attrs.append(_round(rec['dist_3d_tot'], 3))
+            if opt[self.ADD_DELTA_Z]:
+                attrs.append(_round(rec['delta_z_p'], 3))
+            if opt[self.ADD_SLOPE]:
+                attrs.append(_round(rec['slope_deg'], 2))
+                attrs.append(_round(rec['slope_pct'], 2))
+            if opt[self.ADD_AZIMUTH]:
+                az = _round(rec['azimuth_deg'], 2)
+                attrs.append(None if az is None else az % 360.0)
+
+            f = QgsFeature(fields)
+            f.setGeometry(QgsGeometry(QgsPoint(rec['x'], rec['y'], rec['z'])))
+            f.setAttributes(attrs)
+            return f
+
+        # --- main loop --------------------------------------------------------
+        field_names = [fld.name() for fld in source.fields()]
+        use_field = bool(line_id_field) and line_id_field in field_names
+        total = source.featureCount()
+        progress_step = 100.0 / total if total else 0
+        affected = []        # (line id, part no, vertices without DTM value, vertices)
+        outside_parts = []   # (line id, part no) of parts entirely outside the DTM
+        n_lines = n_points = n_skipped_parts = n_extrap_points = 0
+
+        for idx, feat in enumerate(source.getFeatures()):
             if feedback.isCanceled():
                 break
+            feedback.setProgress(int(idx * progress_step))
 
-            line_index += 1
-
-            # Logica determinazione Line ID:
-            # 1. Se è stato scelto un campo valido dal menu a tendina
-            if line_id_field and line_id_field in [f.name() for f in feat.fields()]:
-                line_identifier = str(feat[line_id_field])
-            # 2. Se è stato digitato un nome manuale/custom
-            elif custom_line_id.strip():
-                line_identifier = custom_line_id.strip() if line_layer.featureCount() == 1 else f"{custom_line_id.strip()}_{line_index}"
-            # 3. Default fallback
-            else:
-                line_identifier = f"Line_{line_index}"
+            line_identifier = None
+            if use_field:
+                value = feat[line_id_field]
+                if value is not None and value != NULL:
+                    line_identifier = str(value)
+            if line_identifier is None:
+                if custom_line_id:
+                    line_identifier = custom_line_id if total == 1 else '{0}_{1}'.format(custom_line_id, idx + 1)
+                else:
+                    line_identifier = 'Line_{0}'.format(idx + 1)
 
             geom = feat.geometry()
-            lines = []
-            if geom.isMultipart():
-                multi = geom.asMultiPolyline()
-                if multi:
-                    lines = multi
-            else:
-                single = geom.asPolyline()
-                if single:
-                    lines = [single]
+            if geom is None or geom.isNull() or geom.isEmpty():
+                continue
+            geom = QgsGeometry(geom)
+            if QgsWkbTypes.isCurvedType(geom.wkbType()):
+                geom.convertToStraightSegment()
+            parts = geom.asMultiPolyline() if geom.isMultipart() else [geom.asPolyline()]
 
-            if not lines:
-                lines = [[p for p in geom.vertices()]]
-
-            for line in lines:
-                if len(line) < 2:
+            n_lines += 1
+            for part_no, part in enumerate(parts, start=1):
+                if len(part) < 2:
+                    n_skipped_parts += 1
                     continue
+                xy = [(p.x(), p.y()) for p in part]
+                path, valid_range, n_vert, n_miss = drape_vertices(
+                    densify_xy(xy, step), z_at, extend_outside, feedback.isCanceled)
+                if valid_range is None:
+                    if n_vert:
+                        outside_parts.append((line_identifier, part_no))
+                    continue
+                if n_miss:
+                    affected.append((line_identifier, part_no, n_miss, n_vert))
+                samples = list(resample_3d(path, interval, start_offset, include_end))
+                if not samples:
+                    n_skipped_parts += 1
+                    continue
+                for rec in build_records(samples):
+                    if extend_outside and _outside_valid(rec['dist_2d_tot'], valid_range):
+                        n_extrap_points += 1
+                    sink.addFeature(make_feature(rec, line_identifier, part_no, valid_range),
+                                    QgsFeatureSink.FastInsert)
+                    n_points += 1
 
-                seq_id = 1
+        # --- report -------------------------------------------------------------
+        feedback.pushInfo(self.tr('Processed {0} line feature(s), created {1} point(s).').format(n_lines, n_points))
+        if outside_parts:
+            names = ', '.join('{0} (part {1})'.format(lid, no) for lid, no in outside_parts[:10])
+            if len(outside_parts) > 10:
+                names += ', ...'
+            feedback.reportError(self.tr(
+                '*** WARNING: {0} line part(s) lie completely outside the DTM '
+                '(or on NoData): NO POINTS were created for them: {1} ***'
+            ).format(len(outside_parts), names))
 
-                # Primo punto (Inizio linea)
-                p_first = line[0]
-                z_first = get_z(p_first)
-                pt_trans_first = transform.transform(QgsPointXY(p_first.x(), p_first.y()))
+        if affected:
+            rows = ['    - {0} (part {1}): {2} of {3} sampling vertices ({4:.0f}%)'.format(
+                lid, no, miss, tot, 100.0 * miss / tot) for lid, no, miss, tot in affected[:10]]
+            if len(affected) > 10:
+                rows.append('    ... and {0} more'.format(len(affected) - 10))
+            details = '\n'.join(rows)
+            if extend_outside:
+                feedback.pushWarning(self.tr(
+                    '*** WARNING: part of the input lines lies outside the DTM '
+                    'or on NoData ***\n'
+                    'Affected lines (vertices without elevation):\n{0}\n'
+                    '{1} point(s) beyond the DTM edge were kept with a constant '
+                    'elevation (that of the nearest valid vertex) and are flagged '
+                    'with z_extrap = 1. Gaps in the middle of a line are bridged by '
+                    'linear interpolation of the elevation.'
+                ).format(details, n_extrap_points))
+            else:
+                feedback.reportError(self.tr(
+                    '*** WARNING: part of the input lines lies outside the DTM '
+                    'or on NoData ***\n'
+                    'Affected lines (vertices without elevation):\n{0}\n'
+                    'No points were created where the DTM has no value at the ends '
+                    'of a line (distances are measured from the first vertex with a '
+                    'valid elevation). Gaps in the middle of a line are bridged by '
+                    'linear interpolation of the elevation.\n'
+                    'To keep the points beyond the DTM edge, enable "Keep points '
+                    'beyond the DTM edge".'
+                ).format(details))
 
-                dx_init = line[1].x() - p_first.x()
-                dy_init = line[1].y() - p_first.y()
-                azimuth_first = (math.degrees(math.atan2(dx_init, dy_init)) + 360.0) % 360.0
-
-                f_first = QgsFeature(fields)
-                f_first.setGeometry(QgsGeometry(QgsPoint(p_first.x(), p_first.y(), z_first)))
-
-                if add_line_id: f_first.setAttribute("line_id", line_identifier)
-                if add_seq_id: f_first.setAttribute("seq_id", seq_id)
-                if add_coords:
-                    f_first.setAttribute("x_coord", round(pt_trans_first.x(), 4 if target_crs.isGeographic() else 3))
-                    f_first.setAttribute("y_coord", round(pt_trans_first.y(), 4 if target_crs.isGeographic() else 3))
-                if add_z_ele: f_first.setAttribute("z_ele", round(z_first, 3))
-                if add_dist_2d:
-                    f_first.setAttribute("dist_2d_p", 0.0)
-                    f_first.setAttribute("dist_2d_tot", 0.0)
-                if add_dist_3d:
-                    f_first.setAttribute("dist_3d_p", 0.0)
-                    f_first.setAttribute("dist_3d_tot", 0.0)
-                if add_delta_z: f_first.setAttribute("delta_z_p", 0.0)
-                if add_slope:
-                    f_first.setAttribute("slope_deg", 0.0)
-                    f_first.setAttribute("slope_pct", 0.0)
-                if add_azimuth: f_first.setAttribute("azimuth_deg", round(azimuth_first, 2))
-
-                sink.addFeature(f_first)
-
-                prev_x, prev_y, prev_z = p_first.x(), p_first.y(), z_first
-                cum_dist_2d = 0.0
-
-                current_target_3d = interval
-                accumulated_3d = 0.0
-
-                for i in range(len(line) - 1):
-                    p1, p2 = line[i], line[i+1]
-                    z1, z2 = get_z(p1), get_z(p2)
-
-                    dx = p2.x() - p1.x()
-                    dy = p2.y() - p1.y()
-                    dz = z2 - z1
-
-                    seg_dist_3d = math.sqrt(dx*dx + dy*dy + dz*dz)
-                    if seg_dist_3d == 0:
-                        continue
-
-                    while accumulated_3d + seg_dist_3d >= current_target_3d:
-                        needed_3d = current_target_3d - accumulated_3d
-                        ratio = needed_3d / seg_dist_3d
-
-                        nx = p1.x() + ratio * dx
-                        ny = p1.y() + ratio * dy
-                        nz = z1 + ratio * dz
-
-                        seq_id += 1
-
-                        d2d_prev = math.sqrt((nx - prev_x)**2 + (ny - prev_y)**2)
-                        dz_prev = nz - prev_z
-                        cum_dist_2d += d2d_prev
-
-                        d3d_prev = interval
-                        d3d_tot = (seq_id - 1) * interval
-
-                        # Pendenza
-                        if d2d_prev > 0:
-                            slope_rad = math.atan(abs(dz_prev) / d2d_prev)
-                            slope_deg = math.degrees(slope_rad)
-                            slope_pct = (abs(dz_prev) / d2d_prev) * 100.0
-                        else:
-                            slope_deg = 0.0
-                            slope_pct = 0.0
-
-                        # Azimuth
-                        step_dx = nx - prev_x
-                        step_dy = ny - prev_y
-                        azimuth_deg = (math.degrees(math.atan2(step_dx, step_dy)) + 360.0) % 360.0
-
-                        pt_trans = transform.transform(QgsPointXY(nx, ny))
-
-                        f = QgsFeature(fields)
-                        f.setGeometry(QgsGeometry(QgsPoint(nx, ny, nz)))
-
-                        if add_line_id: f.setAttribute("line_id", line_identifier)
-                        if add_seq_id: f.setAttribute("seq_id", seq_id)
-                        if add_coords:
-                            f.setAttribute("x_coord", round(pt_trans.x(), 4 if target_crs.isGeographic() else 3))
-                            f.setAttribute("y_coord", round(pt_trans.y(), 4 if target_crs.isGeographic() else 3))
-                        if add_z_ele: f.setAttribute("z_ele", round(nz, 3))
-                        if add_dist_2d:
-                            f.setAttribute("dist_2d_p", round(d2d_prev, 3))
-                            f.setAttribute("dist_2d_tot", round(cum_dist_2d, 3))
-                        if add_dist_3d:
-                            f.setAttribute("dist_3d_p", round(d3d_prev, 3))
-                            f.setAttribute("dist_3d_tot", round(d3d_tot, 3))
-                        if add_delta_z: f.setAttribute("delta_z_p", round(dz_prev, 3))
-                        if add_slope:
-                            f.setAttribute("slope_deg", round(slope_deg, 2))
-                            f.setAttribute("slope_pct", round(slope_pct, 2))
-                        if add_azimuth: f.setAttribute("azimuth_deg", round(azimuth_deg, 2))
-
-                        sink.addFeature(f)
-
-                        prev_x, prev_y, prev_z = nx, ny, nz
-                        current_target_3d += interval
-
-                    accumulated_3d += seg_dist_3d
+        if n_skipped_parts:
+            feedback.pushWarning(self.tr(
+                '{0} line part(s) produced no points (too short, or start offset '
+                'longer than the line).').format(n_skipped_parts))
 
         return {self.OUTPUT: dest_id}
 
@@ -434,5 +635,5 @@ class PointsAlong3DLineProvider(QgsProcessingProvider):
     def name(self):
         return 'Points Along 3D Line Tools'
 
-    def icon(self):
-        return QgsProcessingProvider.icon(self)
+    def longName(self):
+        return self.name()
